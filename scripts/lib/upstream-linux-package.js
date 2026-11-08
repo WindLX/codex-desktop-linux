@@ -127,15 +127,45 @@ function verifyPackageControl(filePath, expected) {
   }
 }
 
-async function download(url, destination) {
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) throw new Error(`Download failed (${response.status}) for ${url}`);
-  const directory = path.dirname(destination);
-  fs.mkdirSync(directory, { recursive: true });
-  const output = fs.createWriteStream(destination, { mode: 0o600 });
+async function download(url, destination, options = {}) {
+  const log = options.log ?? console.error;
+  const controller = new AbortController();
+  const idleTimeoutMs = options.idleTimeoutMs ?? 30000;
+  let timeout;
+  const resetTimeout = () => {
+    clearTimeout(timeout);
+    timeout = setTimeout(() => controller.abort(new Error(
+      `No download data for ${idleTimeoutMs / 1000}s: ${url}`,
+    )), idleTimeoutMs);
+  };
+  const started = Date.now();
+  let received = 0;
+  let total = options.size;
+  let waiting = true;
+  const label = path.basename(new URL(url).pathname);
+  const progress = () => {
+    if (waiting) return log(`${label}: waiting for response (${((Date.now() - started) / 1000).toFixed(0)}s)`);
+    const mib = bytes => (bytes / 1048576).toFixed(1);
+    const percent = total ? ` (${Math.min(100, received / total * 100).toFixed(1)}%)` : "";
+    const speed = received / Math.max((Date.now() - started) / 1000, 0.001);
+    log(`${label}: ${mib(received)}${total ? ` / ${mib(total)}` : ""} MiB${percent}, ${mib(speed)} MiB/s`);
+  };
+  progress();
+  const ticker = setInterval(progress, options.progressIntervalMs ?? 1000);
+  let output;
   try {
+    resetTimeout();
+    const response = await fetch(url, { redirect: "follow", signal: controller.signal });
+    if (!response.ok) throw new Error(`Download failed (${response.status}) for ${url}`);
+    waiting = false;
+    total ??= Number(response.headers.get("content-length")) || undefined;
+    resetTimeout();
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    output = fs.createWriteStream(destination, { mode: 0o600 });
     if (response.body != null) {
       for await (const chunk of response.body) {
+        received += chunk.length;
+        resetTimeout();
         if (!output.write(chunk)) {
           await new Promise((resolve, reject) => {
             const onDrain = () => {
@@ -161,12 +191,55 @@ async function download(url, destination) {
       });
       output.once("error", reject);
     });
+    progress();
   } catch (error) {
-    output.destroy();
+    if (output) {
+      if (!output.closed) {
+        await new Promise(resolve => {
+          output.once("close", resolve);
+          output.destroy();
+        });
+      }
+      try {
+        fs.unlinkSync(destination);
+      } catch {}
+    }
+    throw controller.signal.aborted ? controller.signal.reason : error;
+  } finally {
+    clearTimeout(timeout);
+    clearInterval(ticker);
+  }
+}
+
+async function cachedPackage(metadata, repository, options) {
+  const log = options.log ?? console.error;
+  const cacheDir = path.resolve(options.cacheDir ?? process.env.CODEX_UPSTREAM_CACHE_DIR ?? path.join(
+    process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "codex-desktop", "upstream-packages",
+  ));
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const cachedPath = path.join(cacheDir, `${metadata.sha256}.deb`);
+  if (fs.existsSync(cachedPath)) {
+    log(`Checking cached chatgpt ${metadata.version} (${metadata.architecture})`);
     try {
-      fs.unlinkSync(destination);
-    } catch {}
-    throw error;
+      verifyIndexedFile(cachedPath, metadata, "Cached package");
+      verifyPackageControl(cachedPath, metadata);
+      log(`Cache hit: ${cachedPath}`);
+      return cachedPath;
+    } catch (error) {
+      log(`Cache invalid; downloading a replacement: ${error.message}`);
+    }
+  }
+  const partialPath = path.join(cacheDir, `${metadata.sha256}.${crypto.randomUUID()}.part`);
+  try {
+    await download(`${repository}/${metadata.repositoryPath}`, partialPath, { ...options, size: metadata.size });
+    log(`Verifying downloaded chatgpt ${metadata.version} (${metadata.architecture})`);
+    verifyIndexedFile(partialPath, metadata, "Downloaded package");
+    verifyPackageControl(partialPath, metadata);
+    fs.renameSync(partialPath, cachedPath);
+    log(`Cached package: ${cachedPath}`);
+    return cachedPath;
+  } finally {
+    fs.rmSync(partialPath, { force: true });
   }
 }
 
@@ -223,7 +296,8 @@ async function resolveOfficialPackage(options, expectedFingerprint = EXPECTED_FI
     fs.writeFileSync(keyPath, Buffer.from(keyBase64, "base64"), { mode: 0o600 });
 
     const inReleasePath = path.join(outputDir, "InRelease");
-    await download(`${repository}/dists/stable/InRelease`, inReleasePath);
+    await download(`${repository}/dists/stable/InRelease`, inReleasePath, options);
+    (options.log ?? console.error)("Verifying stable InRelease signature");
     const releasePayload = verifyInRelease(inReleasePath, keyPath, expectedFingerprint);
     const releaseEntries = parseReleaseSha256(releasePayload);
     const packagesRelative = `main/binary-${architecture}/Packages`;
@@ -231,7 +305,7 @@ async function resolveOfficialPackage(options, expectedFingerprint = EXPECTED_FI
     if (!indexedPackages) throw new Error(`Signed InRelease does not index ${packagesRelative}`);
 
     const packagesPath = path.join(outputDir, `Packages.${architecture}`);
-    await download(`${repository}/dists/stable/${packagesRelative}`, packagesPath);
+    await download(`${repository}/dists/stable/${packagesRelative}`, packagesPath, options);
     verifyIndexedFile(packagesPath, indexedPackages, packagesRelative);
     metadata = selectChatgptPackage(fs.readFileSync(packagesPath, "utf8"), architecture);
   } catch (error) {
@@ -242,17 +316,25 @@ async function resolveOfficialPackage(options, expectedFingerprint = EXPECTED_FI
 
   let packagePath = null;
   if (!options.metadataOnly) {
-    packagePath = localPackagePath ?? path.join(outputDir, `chatgpt_${metadata.version}_${architecture}.deb`);
-    if (localPackagePath == null) await download(`${repository}/${metadata.repositoryPath}`, packagePath);
-    try {
-      verifyIndexedFile(packagePath, metadata, path.basename(packagePath));
-      verifyPackageControl(packagePath, metadata);
-    } catch (error) {
-      if (localPackagePath == null) throw error;
-      const context = typeof error.code === "string"
-        ? "Could not read the local package for verification against the current signed stable release."
-        : `Local package does not match the current signed stable release (${metadata.version}, ${architecture}).`;
-      throw localPackageVerificationFailure(error, context);
+    packagePath = localPackagePath;
+    if (packagePath == null) {
+      const source = await cachedPackage(metadata, repository, options);
+      packagePath = path.join(outputDir, `chatgpt_${metadata.version}_${architecture}.deb`);
+      // Callers own their output directory (the updater moves its package away).
+      // Keep the shared cache intact; reflink where supported, otherwise copy.
+      fs.copyFileSync(source, packagePath, fs.constants.COPYFILE_FICLONE);
+    }
+    if (localPackagePath != null) {
+      try {
+        (options.log ?? console.error)("Verifying local package against signed stable index");
+        verifyIndexedFile(packagePath, metadata, path.basename(packagePath));
+        verifyPackageControl(packagePath, metadata);
+      } catch (error) {
+        const context = typeof error.code === "string"
+          ? "Could not read the local package for verification against the current signed stable release."
+          : `Local package does not match the current signed stable release (${metadata.version}, ${architecture}).`;
+        throw localPackageVerificationFailure(error, context);
+      }
     }
   }
   const result = {
@@ -281,7 +363,7 @@ async function main() {
     i += 2;
   }
   if (!values["--output-dir"] || !values["--metadata"] || !values["--key-base64"]) {
-    throw new Error("Usage: upstream-linux-package.js --output-dir DIR --metadata FILE --key-base64 FILE [--arch ARCH] [--repository URL] [--metadata-only | --local-package FILE]");
+    throw new Error("Usage: upstream-linux-package.js --output-dir DIR --metadata FILE --key-base64 FILE [--arch ARCH] [--repository URL] [--cache-dir DIR] [--metadata-only | --local-package FILE]");
   }
   const result = await resolveOfficialPackage({
     outputDir: values["--output-dir"],
@@ -290,6 +372,7 @@ async function main() {
     architecture: values["--arch"] ?? os.arch(),
     repository: values["--repository"],
     metadataOnly,
+    cacheDir: values["--cache-dir"],
     localPackagePath: values["--local-package"],
   });
   process.stdout.write(`${result.path ?? values["--metadata"]}\n`);
@@ -303,6 +386,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  download,
   EXPECTED_FINGERPRINT,
   extractClearSignedPayload,
   mapMachineArch,

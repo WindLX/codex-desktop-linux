@@ -84,6 +84,12 @@ make bootstrap-native
 make install-native
 ```
 
+重复构建会复用 `${XDG_CACHE_HOME:-$HOME/.cache}/codex-desktop/upstream-packages/`
+中的已验证包体。每次构建仍重新下载并验证当前 stable 签名索引，再按索引校验
+缓存包；上游发布新版本时才下载新包。下载进度、速度及缓存命中信息输出到 stderr，
+连续 30 秒没有收到数据会报错。只有下载完整且校验通过的包才进入缓存。
+可设置 `CODEX_UPSTREAM_CACHE_DIR` 更改缓存位置，删除该目录即可清理缓存。
+
 若要使用图形化引导安装器，请运行仓库中的独立入口：
 
 ```bash

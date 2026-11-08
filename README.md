@@ -92,6 +92,14 @@ If the dependencies are already installed, use:
 make install-native
 ```
 
+Repeated builds reuse verified package bodies in
+`${XDG_CACHE_HOME:-$HOME/.cache}/codex-desktop/upstream-packages/`.
+Every build still downloads and verifies the current signed stable metadata and
+checks the cached package against it; a new release downloads a new package.
+Downloads show progress, speed, and cache hits on stderr and fail after 30 seconds
+without incoming data. Only fully downloaded, verified packages enter the cache.
+Set `CODEX_UPSTREAM_CACHE_DIR` to relocate it; delete that directory to clear it.
+
 For the graphical guided installer, run the standalone repository entrypoint:
 
 ```bash

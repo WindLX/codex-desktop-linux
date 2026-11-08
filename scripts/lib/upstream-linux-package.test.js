@@ -10,6 +10,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const {
+  download,
   extractClearSignedPayload,
   mapMachineArch,
   parseReleaseSha256,
@@ -119,6 +120,7 @@ test("signed resolution verifies local packages without downloading their bodies
     { name: "local amd64" },
     { name: "local arm64", architecture: "arm64" },
     { name: "downloaded amd64", download: true },
+    { name: "downloaded arm64", architecture: "arm64", download: true },
     { name: "tampered signature", tamperSignature: true, error: /signature verification failed/ },
     { name: "wrong signer", wrongSigner: true, error: /signature verification failed/ },
     { name: "wrong pinned key", wrongKey: true, error: /expected fingerprint/ },
@@ -192,6 +194,7 @@ test("signed resolution verifies local packages without downloading their bodies
       });
       const options = {
         architecture, repository, keyBase64Path: fixtureKey,
+        cacheDir: path.join(current, "cache"),
         outputDir: path.join(current, "verified"), metadataPath: path.join(current, "metadata.json"),
         ...(scenario.download ? {} : { localPackagePath: file }),
       };
@@ -212,6 +215,9 @@ test("signed resolution verifies local packages without downloading their bodies
           return true;
         });
         assert.equal(fs.existsSync(options.metadataPath), false);
+        if (scenario.download && fs.existsSync(options.cacheDir)) {
+          assert.deepEqual(fs.readdirSync(options.cacheDir), [], "failed downloads never enter cache");
+        }
       } else {
         const result = await resolveOfficialPackage(options, signer.fingerprint);
         assert.equal(result.signatureVerification, "verified");
@@ -221,6 +227,29 @@ test("signed resolution verifies local packages without downloading their bodies
         if (!scenario.download) {
           assert.equal(result.path, file);
           assert.equal(result.explicitlyProvided, true);
+        }
+        if (scenario.download) {
+          assert.equal(path.dirname(result.path), options.outputDir);
+          const cachePath = path.join(options.cacheDir, `${result.sha256}.deb`);
+          assert.deepEqual(fs.readFileSync(cachePath), body);
+          const messages = [];
+          options.log = message => messages.push(message);
+          requested.length = 0;
+          const cached = await resolveOfficialPackage(options, signer.fingerprint);
+          assert.equal(cached.path, result.path);
+          assert.equal(requested.length, 2, "cache hits still fetch both signed metadata files");
+          assert.equal(requested.some(url => url.includes("/pool/")), false);
+          assert.ok(messages.some(message => /cache hit/i.test(message)));
+          fs.unlinkSync(cached.path);
+          assert.ok(fs.existsSync(cachePath), "callers can move or delete their output without consuming the cache");
+          fs.appendFileSync(cachePath, "corrupt");
+          requested.length = 0;
+          await resolveOfficialPackage(options, signer.fingerprint);
+          assert.equal(requested.some(url => url.includes("/pool/")), true, "corrupt cache is replaced");
+          assert.deepEqual(fs.readFileSync(cachePath), body);
+          inRelease = inRelease.replace("Codename: stable", "Codename: changed");
+          await assert.rejects(resolveOfficialPackage(options, signer.fingerprint), /signature verification failed/);
+          assert.equal(fs.readdirSync(options.cacheDir).some(name => name.endsWith(".part")), false);
         }
       }
       assert.equal(requested.some(url => url.includes("/pool/")), scenario.download === true);
@@ -266,4 +295,48 @@ test("local-package cannot be combined with metadata-only resolution", async () 
   await assert.rejects(resolveOfficialPackage({
     architecture: "amd64", localPackagePath: "unused.deb", metadataOnly: true,
   }), /cannot be combined/);
+});
+
+
+test("downloads report progress while waiting and clean up stalled transfers", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-download-progress-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const server = http.createServer((request, response) => {
+    if (request.url === "/headers") return;
+    response.writeHead(200, { "Content-Length": "100" });
+    response.write("hello");
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  for (const suffix of ["headers", "body"]) {
+    const messages = [];
+    const target = path.join(root, suffix);
+    await assert.rejects(download(`${base}/${suffix}`, target, {
+      log: message => messages.push(message), idleTimeoutMs: 150, progressIntervalMs: 30,
+    }), /No download data/);
+    assert.ok(messages.length >= 2, "progress is visible even during a stall");
+    assert.ok(messages.some(message => /waiting|MiB/.test(message)));
+    assert.equal(fs.existsSync(target), false);
+  }
+});
+
+test("an immediate body error leaves no partial file after the output stream closes", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-download-early-error-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const target = path.join(root, "package.part");
+  const createWriteStream = fs.createWriteStream;
+  let closed;
+  t.mock.method(fs, "createWriteStream", (...args) => {
+    const output = createWriteStream(...args);
+    closed = once(output, "close");
+    return output;
+  });
+  t.mock.method(globalThis, "fetch", async () => new Response(new ReadableStream({
+    start(controller) { controller.error(new Error("connection closed")); },
+  })));
+  await assert.rejects(download("https://fixture.invalid/package.deb", target, { log() {} }), /connection closed/);
+  await closed;
+  assert.equal(fs.existsSync(target), false);
 });
